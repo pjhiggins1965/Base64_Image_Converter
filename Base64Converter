@@ -1,33 +1,55 @@
 <#
 .SYNOPSIS
-    PowerShell GUI application for bidirectional image/Base64 conversion.
+    GUI tool for converting images to Base64 and back.
 
 .DESCRIPTION
-    A Windows Forms-based GUI tool that converts images to Base64 format and vice versa.
-    Supports major image formats (JPG, PNG, GIF, BMP, TIFF) with file browser, image preview,
-    clipboard integration, and toggleable data URL prefix output. Ideal for web development
-    and data encoding workflows.
+    A Windows Forms application that converts image files to Base64 strings and decodes
+    Base64 strings back to image files. Supports JPG, JPEG, PNG, GIF, BMP, TIF and TIFF
+    input, with a thumbnail preview of the selected file.
 
-.FEATURES
-    - Convert images to Base64 with optional data URL prefix
-    - Convert Base64 back to image files
-    - Image preview and file browsing
-    - Clipboard copy/paste functionality
-    - Support for multiple image formats
-    - 10MB file size limit for performance
+    Base64 output can optionally include the data URL prefix (data:image/png;base64,...)
+    for direct use in HTML or CSS, or be emitted as a bare encoded string for APIs and
+    database storage. The prefix setting is read at conversion time, so toggling it after
+    a conversion requires converting again.
 
-.AUTHOR
-    pjhiggins (GitHub: pjhiggins1965)
+    When decoding, either form is accepted. The prefix is stripped automatically if
+    present. Decoding writes the original bytes unchanged, so the extension chosen in the
+    save dialog does not re-encode the image.
 
-.VERSION
-    1.0
+    Input files are capped at 10 MB, since Base64 runs roughly 33% larger than the source
+    and the text box becomes sluggish beyond that.
 
-.DATE
-    August 2025
+.EXAMPLE
+    .\Base64Converter.ps1
+
+    Launches the GUI. All operations are performed through the interface.
+
+.EXAMPLE
+    powershell.exe -ExecutionPolicy Bypass -File .\Base64Converter.ps1
+
+    Launches the GUI without changing the machine's execution policy. Useful if the
+    script was downloaded and is blocked.
+
+.EXAMPLE
+    pwsh.exe -STA -File .\Base64Converter.ps1
+
+    Launches the GUI under PowerShell 7, which defaults to MTA. The -STA switch is
+    required there or the clipboard buttons will fail.
 
 .NOTES
-    Requires PowerShell with Windows Forms support
-    Run with: Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+    Author:  pjhiggins
+    GitHub:  pjhiggins1965
+    Version: 1.1
+    Date:    2026-09-08
+
+    Requires Windows PowerShell 5.1 or PowerShell 7 on Windows. Will not run on Linux
+    or macOS, since Windows Forms is Windows-only.
+
+    Windows PowerShell 5.1 runs STA by default and needs no special handling. PowerShell 7
+    runs MTA by default, and the clipboard operations require STA, so launch it with -STA.
+
+.LINK
+    https://github.com/pjhiggins1965
 #>
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -56,20 +78,20 @@ $filePathTextBox.ReadOnly = $true
 # Browse button
 $browseButton = New-Object System.Windows.Forms.Button
 $browseButton.Text = "Browse"
-$browseButton.Location = New-Object System.Drawing.Point(600, 25)
-$browseButton.Size = New-Object System.Drawing.Size(75, 23)
+$browseButton.Location = New-Object System.Drawing.Point(600, 24)
+$browseButton.Size = New-Object System.Drawing.Size(150, 25)
 
 # Convert to Base64 button
 $convertToBase64Button = New-Object System.Windows.Forms.Button
 $convertToBase64Button.Text = "Convert to Base64"
-$convertToBase64Button.Location = New-Object System.Drawing.Point(685, 25)
-$convertToBase64Button.Size = New-Object System.Drawing.Size(65, 45)
+$convertToBase64Button.Location = New-Object System.Drawing.Point(600, 55)
+$convertToBase64Button.Size = New-Object System.Drawing.Size(150, 30)
 $convertToBase64Button.Enabled = $false
 
 # Checkbox for data URL prefix option
 $includeDataUrlCheckBox = New-Object System.Windows.Forms.CheckBox
 $includeDataUrlCheckBox.Text = "Include data URL prefix (data:image/...;base64,)"
-$includeDataUrlCheckBox.Location = New-Object System.Drawing.Point(10, 55)
+$includeDataUrlCheckBox.Location = New-Object System.Drawing.Point(10, 58)
 $includeDataUrlCheckBox.Size = New-Object System.Drawing.Size(350, 20)
 $includeDataUrlCheckBox.Checked = $true
 
@@ -87,12 +109,15 @@ $base64GroupBox.Location = New-Object System.Drawing.Point(10, 125)
 $base64GroupBox.Size = New-Object System.Drawing.Size(580, 300)
 
 # Base64 textbox
+# MaxLength 0 removes the default 32767 character cap, which would otherwise
+# silently truncate anything larger than a very small image.
 $base64TextBox = New-Object System.Windows.Forms.TextBox
 $base64TextBox.Location = New-Object System.Drawing.Point(10, 25)
 $base64TextBox.Size = New-Object System.Drawing.Size(560, 220)
 $base64TextBox.Multiline = $true
 $base64TextBox.ScrollBars = "Vertical"
 $base64TextBox.WordWrap = $false
+$base64TextBox.MaxLength = 0
 
 # Control buttons for Base64 operations
 $copyButton = New-Object System.Windows.Forms.Button
@@ -124,7 +149,7 @@ $statusLabel.ForeColor = "Blue"
 
 # Information label
 $infoLabel = New-Object System.Windows.Forms.Label
-$infoLabel.Text = "Supported formats: JPG, PNG, GIF, BMP, TIFF | Max file size: 10MB | Toggle data URL prefix as needed"
+$infoLabel.Text = "Supported formats: JPG, PNG, GIF, BMP, TIF, TIFF | Max file size: 10MB | Toggle data URL prefix as needed"
 $infoLabel.Location = New-Object System.Drawing.Point(10, 475)
 $infoLabel.Size = New-Object System.Drawing.Size(760, 20)
 $infoLabel.ForeColor = "Gray"
@@ -132,22 +157,50 @@ $infoLabel.ForeColor = "Gray"
 # Global variable to store current image path
 $script:currentImagePath = $null
 
+function Set-PreviewImage {
+    <#
+        Loads the preview through a MemoryStream and copies it into a new Bitmap.
+        Image::FromFile would hold an open handle on the source file for as long as
+        the object lives, which locks the file against rename, move and delete.
+        The old image is disposed first so repeated browsing does not leak GDI handles.
+    #>
+    param([string]$Path)
+
+    if ($pictureBox.Image) {
+        $old = $pictureBox.Image
+        $pictureBox.Image = $null
+        $old.Dispose()
+    }
+
+    $stream = $null
+    $loaded = $null
+    try {
+        $imageBytes = [System.IO.File]::ReadAllBytes($Path)
+        $stream = New-Object System.IO.MemoryStream(,$imageBytes)
+        $loaded = [System.Drawing.Image]::FromStream($stream)
+        $pictureBox.Image = New-Object System.Drawing.Bitmap($loaded)
+        return $pictureBox.Image
+    }
+    finally {
+        if ($loaded) { $loaded.Dispose() }
+        if ($stream) { $stream.Dispose() }
+    }
+}
+
 # Browse button click event
 $browseButton.Add_Click({
     $openFileDialog = New-Object System.Windows.Forms.OpenFileDialog
-    $openFileDialog.Filter = "Image Files|*.jpg;*.jpeg;*.png;*.gif;*.bmp;*.tiff|All Files|*.*"
+    $openFileDialog.Filter = "Image Files|*.jpg;*.jpeg;*.png;*.gif;*.bmp;*.tif;*.tiff|All Files|*.*"
     $openFileDialog.Title = "Select an Image File"
-    
+
     if ($openFileDialog.ShowDialog() -eq "OK") {
         $script:currentImagePath = $openFileDialog.FileName
         $filePathTextBox.Text = $script:currentImagePath
         $convertToBase64Button.Enabled = $true
-        
-        # Load image preview
+
         try {
-            $image = [System.Drawing.Image]::FromFile($script:currentImagePath)
-            $pictureBox.Image = $image
-            $statusLabel.Text = "Image loaded: $($image.Width)x$($image.Height) pixels"
+            $preview = Set-PreviewImage -Path $script:currentImagePath
+            $statusLabel.Text = "Image loaded: $($preview.Width)x$($preview.Height) pixels"
             $statusLabel.ForeColor = "Green"
         }
         catch {
@@ -167,15 +220,15 @@ $convertToBase64Button.Add_Click({
                 [System.Windows.Forms.MessageBox]::Show("File size exceeds 10MB limit.", "Error", "OK", "Error")
                 return
             }
-            
+
             $statusLabel.Text = "Converting to Base64..."
             $statusLabel.ForeColor = "Blue"
             $form.Refresh()
-            
+
             # Read file and convert to Base64
             $bytes = [System.IO.File]::ReadAllBytes($script:currentImagePath)
             $base64String = [System.Convert]::ToBase64String($bytes)
-            
+
             # Get file extension for data URL
             $extension = [System.IO.Path]::GetExtension($script:currentImagePath).ToLower()
             $mimeType = switch ($extension) {
@@ -184,19 +237,18 @@ $convertToBase64Button.Add_Click({
                 ".png"  { "image/png" }
                 ".gif"  { "image/gif" }
                 ".bmp"  { "image/bmp" }
+                ".tif"  { "image/tiff" }
                 ".tiff" { "image/tiff" }
-                default { "image/jpeg" }
+                default { "application/octet-stream" }
             }
-            
+
             # Create output based on checkbox selection
             if ($includeDataUrlCheckBox.Checked) {
-                # Create data URL format
                 $output = "data:$mimeType;base64,$base64String"
                 $base64TextBox.Text = $output
                 $statusLabel.Text = "Conversion completed with data URL prefix. Total length: $($output.Length) characters"
             }
             else {
-                # Raw Base64 only
                 $base64TextBox.Text = $base64String
                 $statusLabel.Text = "Conversion completed (raw Base64). Length: $($base64String.Length) characters"
             }
@@ -247,7 +299,11 @@ $pasteButton.Add_Click({
 $clearButton.Add_Click({
     $base64TextBox.Text = ""
     $filePathTextBox.Text = ""
-    $pictureBox.Image = $null
+    if ($pictureBox.Image) {
+        $old = $pictureBox.Image
+        $pictureBox.Image = $null
+        $old.Dispose()
+    }
     $convertToBase64Button.Enabled = $false
     $script:currentImagePath = $null
     $statusLabel.Text = "Data cleared"
@@ -259,15 +315,15 @@ $convertFromBase64Button.Add_Click({
     if ($base64TextBox.Text.Trim() -ne "") {
         try {
             $saveFileDialog = New-Object System.Windows.Forms.SaveFileDialog
-            $saveFileDialog.Filter = "PNG Image|*.png|JPEG Image|*.jpg|GIF Image|*.gif|BMP Image|*.bmp|All Files|*.*"
+            $saveFileDialog.Filter = "PNG Image|*.png|JPEG Image|*.jpg|GIF Image|*.gif|BMP Image|*.bmp|TIFF Image|*.tif|All Files|*.*"
             $saveFileDialog.Title = "Save Image As"
             $saveFileDialog.DefaultExt = "png"
-            
+
             if ($saveFileDialog.ShowDialog() -eq "OK") {
                 $statusLabel.Text = "Converting from Base64..."
                 $statusLabel.ForeColor = "Blue"
                 $form.Refresh()
-                
+
                 # Extract Base64 data (remove data URL prefix if present)
                 $base64Data = $base64TextBox.Text.Trim()
                 if ($base64Data.StartsWith("data:")) {
@@ -276,11 +332,11 @@ $convertFromBase64Button.Add_Click({
                         $base64Data = $base64Data.Substring($commaIndex + 1)
                     }
                 }
-                
+
                 # Convert Base64 to bytes and save
                 $bytes = [System.Convert]::FromBase64String($base64Data)
                 [System.IO.File]::WriteAllBytes($saveFileDialog.FileName, $bytes)
-                
+
                 $statusLabel.Text = "Image saved successfully: $($saveFileDialog.FileName)"
                 $statusLabel.ForeColor = "Green"
             }
@@ -296,6 +352,14 @@ $convertFromBase64Button.Add_Click({
     }
 })
 
+# Release the preview bitmap when the window closes
+$form.Add_FormClosed({
+    if ($pictureBox.Image) {
+        $pictureBox.Image.Dispose()
+        $pictureBox.Image = $null
+    }
+})
+
 # Add controls to form
 $fileGroupBox.Controls.AddRange(@($filePathTextBox, $browseButton, $convertToBase64Button, $includeDataUrlCheckBox))
 $base64GroupBox.Controls.AddRange(@($base64TextBox, $copyButton, $pasteButton, $clearButton, $convertFromBase64Button))
@@ -303,3 +367,4 @@ $form.Controls.AddRange(@($fileGroupBox, $base64GroupBox, $pictureBox, $statusLa
 
 # Show the form
 $form.ShowDialog() | Out-Null
+$form.Dispose()
